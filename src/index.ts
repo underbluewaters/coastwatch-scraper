@@ -58,7 +58,7 @@ export default {
         southBoundary,
         url: `https://oregonshores.org/mile/mile-${id}-${slugify(name.toLowerCase())}/`,
       } as any;
-      if (imagesFetched++ < 500) {
+      if (imagesFetched++ < 1000) {
         const response = await fetch(mile.url);
         const body = await response.text();
         const $$ = cheerio.load(body);
@@ -66,8 +66,8 @@ export default {
         if (imageUrl) {
           mile.imageUrl = imageUrl;
         }
-        const reports = $$('.mile-report-all-mile-reports h4:nth-of-type(1)').text();
-        const data = /(\d+) Report/.exec(reports);
+        const reports = $$('.results-meta .num-results p').text();
+        const data = /Showing \d+ of (\d+) reports/.exec(reports);
         if (data && data[1]) {
           const numReports = parseInt(data[1]);
           if (!isNaN(numReports)) {
@@ -77,8 +77,16 @@ export default {
       }
       miles.push(mile);
     }
+    if (!miles.find((mile) => !mile.imageUrl)) {
+      throw new Error('No images found for any miles. Could the website have changed?');
+    } else if (!miles.find((mile) => !mile.numReports)) {
+      throw new Error('No reports found for any miles. Could the website have changed?');
+    } else if (miles.length < 10) {
+      throw new Error('Only found ' + miles.length + ' miles. Could the website have changed?');
+    }
     const featureCollection = {
       type: 'FeatureCollection',
+      updatedAt: new Date().toISOString(),
       features: miles.map((mile) => ({
         type: 'Feature',
         id: mile.id,

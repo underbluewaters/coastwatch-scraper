@@ -6,7 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 [triggers]
 # Schedule cron triggers:
 # every day at 3am
-crons = [ "0 3 * * *" ]
+crons = [ "* 3 * * *" ]
 
 # Bind a KV Namespace. Use KV as persistent storage for small key-value pairs.
 # Docs: https://developers.cloudflare.com/workers/runtime-apis/kv
