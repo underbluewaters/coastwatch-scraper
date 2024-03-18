@@ -95,6 +95,7 @@ export default {
           url: mile.url,
           imageUrl: mile.imageUrl,
           numReports: mile.numReports,
+          mileNumber: mile.id,
         },
         geometry: {
           type: 'Point',
