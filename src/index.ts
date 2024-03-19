@@ -1,22 +1,31 @@
-import * as cheerio from 'cheerio';
-import slugify from 'slugify';
+import * as cheerio from "cheerio";
+import slugify from "slugify";
+import { Feature, Point } from "geojson";
 
 export interface Env {
   // Example binding to KV. Learn more at https://developers.cloudflare.com/workers/runtime-apis/kv/
   miles: KVNamespace;
 }
 
-export default {
+type MileFeature = Feature<Point, {
+  name: string;
+  url: string;
+  imageUrl?: string;
+  numReports?: number;
+  mileNumber: number;
+}>;
 
+export default {
   /**
-   * Fetches data from a CoastWatch Google Spreadsheet and processes it to 
+   * scheduled()
+   * Fetches data from a CoastWatch Google Spreadsheet and processes it to
    * create a feature collection of miles. Includes the mile name, URL, and
-   * coordinates. Also fetches the mile image and number of reports if 
+   * coordinates. Also fetches the mile image and number of reports if
    * available.
-   * 
+   *
    * This scheduled function is triggered by a cron job that runs every day at
    * 3am (controlled by wrangler.toml).
-   * 
+   *
    * @param event - The event object.
    * @param env - The environment object.
    * @param ctx - The execution context object.
@@ -28,102 +37,128 @@ export default {
     );
     const body = await response.text();
     const $ = cheerio.load(body);
-    const miles: {
-      id: number;
-      name: string;
-      northBoundary: number[];
-      southBoundary: number[];
-      url: string;
-      imageUrl?: string;
-      numReports?: number;
-    }[] = [];
+    // Start constructing a GeoJSON feature collection of miles
+    const miles = {
+      type: "FeatureCollection",
+      updatedAt: new Date().toISOString(),
+      features: [] as MileFeature[]
+    }
     let imagesFetched = 0;
-    for (const row of $('table tbody tr')) {
-      const id = parseInt($(row).find('td:nth-child(2)').text());
+    // Start parsing all the rows of the html table
+    for (const row of $("table tbody tr")) {
+      const id = parseInt($(row).find("td:nth-child(2)").text());
+      // Skip header rows
       if (isNaN(id)) {
         continue;
       }
-      const name = $(row).find('td:nth-child(3)').text();
+      const name = $(row).find("td:nth-child(3)").text();
+      // Not really sure what this is, but it's not a mile
       if (/never captured on OSCC website/.test(name)) {
         continue;
       }
-      let coords = $(row).find('td:nth-child(4)').text().split(',').reverse();
-      const northBoundary = coords.map((coord) => parseFloat(coord));
-      coords = $(row).find('td:nth-child(5)').text().split(',').reverse();
-      const southBoundary = coords.map((coord) => parseFloat(coord));
-      const mile = {
+      // Just grab the south boundary to contruct a point
+      const coords = $(row).find("td:nth-child(5)").text().split(",").reverse();
+      const feature: MileFeature = {
+        type: "Feature",
         id,
-        name,
-        northBoundary,
-        southBoundary,
-        url: `https://oregonshores.org/mile/mile-${id}-${slugify(name.toLowerCase())}/`,
-      } as any;
-      if (imagesFetched++ < 1000) {
-        const response = await fetch(mile.url);
+        properties: {
+          name,
+          url: `https://oregonshores.org/mile/mile-${id}-${slugify(
+            name.toLowerCase()
+          )}/`,
+          mileNumber: id,
+        },
+        geometry: {
+          type: "Point",
+          coordinates: coords.map((coord) => parseFloat(coord))
+        },
+      };
+      // There are only 339 miles, so we can limit the number of mile-pages
+      // visited. This is just a sanity check to keep the function from running
+      // forever if the website changes.
+      if (imagesFetched++ < 500) {
+        // Fetch the mile detail page to get the image and number of reports
+        const response = await fetch(feature.properties.url);
         const body = await response.text();
         const $$ = cheerio.load(body);
-        const imageUrl = $$('img.mile-image').attr('src');
+        // There may be a representative image on the mile page
+        const imageUrl = $$("img.mile-image").attr("src");
         if (imageUrl) {
-          mile.imageUrl = imageUrl;
+          feature.properties.imageUrl = imageUrl;
+        } else {
+          // As a backup, find images from volunteer submitted reports, but be
+          // sure to skip over placeholder images, indicated by the alt text.
+          const reportImageUrl = $$(
+            "img.mile-report-result-image:not([alt*=decorative])"
+          )
+            .first()
+            .attr("src");
+          if (reportImageUrl) {
+            feature.properties.imageUrl = reportImageUrl;
+          }
         }
-        const reports = $$('.results-meta .num-results p').text();
+        // Try to get the number of reports from the pagination text
+        const reports = $$(".results-meta .num-results p").text();
         const data = /Showing \d+ of (\d+) reports/.exec(reports);
         if (data && data[1]) {
           const numReports = parseInt(data[1]);
           if (!isNaN(numReports)) {
-            mile.numReports = numReports;
+            feature.properties.numReports = numReports;
           }
         }
       }
-      miles.push(mile);
+      miles.features.push(feature);
     }
-    if (!miles.find((mile) => !mile.imageUrl)) {
-      throw new Error('No images found for any miles. Could the website have changed?');
-    } else if (!miles.find((mile) => !mile.numReports)) {
-      throw new Error('No reports found for any miles. Could the website have changed?');
-    } else if (miles.length < 10) {
-      throw new Error('Only found ' + miles.length + ' miles. Could the website have changed?');
+    // Sanity check that it looks like we got useful data from the site. If the
+    // site changes, throw an exception that will hopefully be caught by 
+    // monitoring of the cron workers. Even if it fails, the old data will still
+    // be served from the KV store.
+    if (!miles.features.find((mile) => !mile.properties.imageUrl)) {
+      throw new Error(
+        "No images found for any miles. Could the website have changed?"
+      );
+    } else if (!miles.features.find((mile) => !mile.properties.numReports)) {
+      throw new Error(
+        "No reports found for any miles. Could the website have changed?"
+      );
+    } else if (miles.features.length < 10) {
+      throw new Error(
+        `Only found ${miles.features.length} miles. Could the website have changed?`
+      );
     }
-    const featureCollection = {
-      type: 'FeatureCollection',
-      updatedAt: new Date().toISOString(),
-      features: miles.map((mile) => ({
-        type: 'Feature',
-        id: mile.id,
-        properties: {
-          name: mile.name,
-          url: mile.url,
-          imageUrl: mile.imageUrl,
-          numReports: mile.numReports,
-          mileNumber: mile.id,
-        },
-        geometry: {
-          type: 'Point',
-          coordinates: mile.southBoundary,
-        },
-      })),
-    };
-    await env.miles.put('miles', JSON.stringify(featureCollection, null, 2));
+    // Save the feature collection to the KV store
+    await env.miles.put("miles", JSON.stringify(miles, null, 2));
     return;
   },
   /**
-   * Simply returns the feature collection of miles from KV store. Must be 
+   * fetch()
+   * Simply returns the feature collection of miles from KV store. Must be
    * created and updated by the scheduled function.
-   * @param request 
-   * @param env 
-   * @param ctx 
-   * @returns 
+   * @param request
+   * @param env
+   * @param ctx
+   * @returns
    */
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const featureCollection = await env.miles.get('miles');
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext
+  ): Promise<Response> {
+    // Make sure it's a GET request
+    if (request.method !== "GET") {
+      return new Response("Only GET supported", { status: 403 });
+    }
+    const featureCollection = await env.miles.get("miles");
     if (!featureCollection) {
-      return new Response('Not found. Cron job did not create dataset?', { status: 404 });
+      return new Response("Not found. Cron job did not create dataset?", {
+        status: 404,
+      });
     } else {
       return new Response(featureCollection, {
         headers: {
-          'content-type': 'application/json',
+          "content-type": "application/json",
           // 24 hour cache
-          'cache-control': 'public, max-age=86400',
+          "cache-control": "public, max-age=86400",
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
           "Access-Control-Max-Age": "86400",
